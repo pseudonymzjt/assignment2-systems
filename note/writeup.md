@@ -39,3 +39,47 @@ change, compared to doing inference (forward pass only)? How about other kernels
 within the self-attention layer of your model during a forward pass. How does the difference 
 in runtimes compare to the difference in FLOPs?
 > While the matrix multiplication (`final matmul`) requires roughly $2 \cdot d_k / 3 \approx 21\times$ more FLOPs than the softmax operation ($2 B H L^2 d_k$ vs. $3 B H L^2$), their actual runtimes are nearly identical (~108 µs each). This vast discrepancy occurs because GEMM is **compute-bound** and achieves high arithmetic intensity on GPU compute units, whereas softmax is **memory-bound** and bottlenecked by DRAM read/write bandwidth across multiple elementwise passes.
+
+### mixed precision
+> As expected, in [code provided](../cs336_systems/mixed_precision.py), float32 offeres highest precision(10.0001), and using float16 all along gets the worst result(9.9531). And the third and fourth experiments show that improving precision after computation makes no sense(both 10.0021).
+
+1. Consider the following model:
+```python
+class ToyModel(nn.Module):
+def __init__(self, in_features: int, out_features: int):
+    super().__init__()
+    self.fc1 = nn.Linear(in_features, 10, bias=False)
+    self.ln = nn.LayerNorm(10)
+    self.fc2 = nn.Linear(10, out_features, bias=False)
+    self.relu = nn.ReLU()
+def forward(self, x):
+    x = self.relu(self.fc1(x))
+    x = self.ln(x)
+    x = self.fc2(x)
+    return x
+```
+Suppose we are training the model on a GPU and that the model parameters are originally in 
+FP32. We’d like to use autocasting mixed precision with FP16. What are the data types of:
+• the model parameters within the autocast context?
+• the output of the first feed-forward layer (ToyModel.fc1)?
+• the output of layer norm (ToyModel.ln)?
+• the model’s predicted logits?
+• the loss?
+• the model’s gradients?
+> float32; float16; float32; float16; float32; float32
+2. You should have seen that FP16 mixed precision autocasting treats the layer normalization 
+layer differently than the feed-forward layers. What parts of layer normalization are sensitive 
+to mixed precision? If we use BF16 instead of FP16, do we still need to treat layer 
+normalization differently? Why or why not?
+> LN is easier to underflow or overflow cause'of the unenough 5 expo digits. The mantissa of BF16 is only 7, not very accurate, may leading to unstability of result.
+3. Modify your benchmarking script to optionally run the model using mixed precision with 
+BF16. Time the forward and backward passes with and without mixed-precision for each 
+language model size described in 
+Section 2.1.2. Compare the results of using full precision 
+versus mixed precision, and comment on any trends as model size changes. You may find the 
+nullcontext no-op context manager to be useful.
+[bf16](figures/train_bf16.png)
+[fp32](figures/train_fp32.png)
+> Comparing full-precision (FP32) to mixed-precision (BF16) on a complete training step, BF16 achieves roughly a 1.95× speedup in overall runtime (reducing total benchmark time from ~1.76s down to ~0.90s), with the backward pass exhibiting the most prominent acceleration (~2.95× speedup).
+> Across kernel breakdowns, the dominant SGEMM kernels (originally accounting for >65% of GPU time) are replaced by Tensor Core CUTLASS BF16 kernels whose aggregate execution time drops by ~4.7×.
+> As model parameters and sequence dimensions grow, the workload transitions from being dispatch/bandwidth-bound to compute-bound, allowing the BF16 Tensor Core arithmetic throughput advantage to become increasingly pronounced while cutting backward activation memory bandwidth.
